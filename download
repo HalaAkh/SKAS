@@ -1,0 +1,10 @@
+# datasets (download them, see README)
+*.xlsx
+*.csv
+*.csv.gz
+*.pkl
+*.zip
+# generated outputs
+protected_*_sample.csv
+stealth_results_all_samples.csv
+__pycache__/
