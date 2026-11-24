@@ -3,13 +3,18 @@
 What it does
   1. Loads a dataset and picks one sensitive column (retail: Price, taxi: END_LAT).
   2. Hides that column in three ordinary-looking columns, made from a secret
-     seed and the row number (retail: PickedAt / PackedAt / ScannedAt
+     seed, the row's permanent key (RowKey) and its version number (retail: PickedAt / PackedAt / ScannedAt
      warehouse times for each order line; taxi: a waypoint latitude and longitude near the pickup point and a
      dispatch time shortly before the trip starts).
   3. Rebuilds the column with the right seed and checks it is 100% exact.
   4. Rebuilds it with wrong seeds and checks the result looks realistic (honey).
   5. Prints timings, checks that the disguised columns have natural offsets,
      and saves the first rows of the protected table to CSV.
+  6. Updates: a changed value is re-protected with version+1, so the old and
+     new rows use different masks (an attacker cannot subtract them).
+  7. Integrity: a per-row tag under a SEPARATE key detects any edited cell
+     (it never touches the honey seed, so it cannot be used to test seed guesses).
+  8. Stable keys: rows are rebuilt by RowKey, so reordering the table is harmless.
 
 Setup (once):
     pip install numpy pandas cryptography openpyxl
@@ -47,14 +52,36 @@ def derive(seed: bytes, label: str) -> bytes:
     return hmac.new(seed, b"skas-kdf|" + label.encode(), hashlib.sha256).digest()[:16]
 
 
-def row_masks(key: bytes, row_ids, modulus: int) -> np.ndarray:
-    """One secret number per row: AES(key, row id) reduced to 0..modulus-1."""
+def row_masks(key: bytes, row_ids, modulus: int, versions=None) -> np.ndarray:
+    """One secret number per row: AES(key, version || row key) reduced to 0..modulus-1.
+    A new version gives a completely new mask, so updated rows never reuse a mask."""
     ids = np.asarray(row_ids, dtype=np.uint64)
     blocks = np.zeros((len(ids), 2), dtype=np.uint64)
+    if versions is not None:
+        blocks[:, 0] = np.asarray(versions, dtype=np.uint64)
     blocks[:, 1] = ids
     enc = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
     out = np.frombuffer(enc.update(blocks.tobytes()) + enc.finalize(), dtype=np.uint64)
     return (out.reshape(-1, 2)[:, 0] % np.uint64(modulus)).astype(np.int64)
+
+
+def as_u64(x) -> np.ndarray:
+    return np.asarray(np.round(np.asarray(x, dtype=np.float64)) if np.asarray(x).dtype.kind == "f" else x,
+                      dtype=np.int64).view(np.uint64)
+
+
+def integrity_tags(mac_key: bytes, fields) -> np.ndarray:
+    """Per-row integrity tag: AES-CBC-MAC (fixed length) over the row key, version,
+    the disguised columns and their base columns. Uses its own random key, not the seed."""
+    cols = [as_u64(f) for f in fields]
+    if len(cols) % 2:
+        cols.append(np.zeros(len(cols[0]), dtype=np.uint64))
+    enc = Cipher(algorithms.AES(mac_key), modes.ECB()).encryptor()
+    state = np.zeros((len(cols[0]), 2), dtype=np.uint64)
+    for a in range(0, len(cols), 2):
+        state ^= np.stack([cols[a], cols[a + 1]], axis=1)
+        state = np.frombuffer(enc.update(state.tobytes()), dtype=np.uint64).reshape(-1, 2).copy()
+    return state[:, 0]
 
 
 def fresh_random(n: int, modulus: int) -> np.ndarray:
@@ -128,8 +155,8 @@ class StorageOnly:
     def _base(self, j, table, cols):
         return cols[j - 1] if self.bases[j] == "prev" else table[self.bases[j]]
 
-    def split(self, seed, row_ids, values, table):
-        k = row_masks(derive(seed, self.name + "|mask"), row_ids, M)     # secret mask per row
+    def split(self, seed, row_ids, values, table, versions=None):
+        k = row_masks(derive(seed, self.name + "|mask"), row_ids, M, versions)  # secret mask per row
         u = self.dte.encode(values, fresh_random(len(values), 1 << 30))  # value -> code
         w = (u + k) % M                                                  # masked code
         cols = []
@@ -138,13 +165,16 @@ class StorageOnly:
             cols.append(self.decoys[j].encode(piece, self._base(j, table, cols)))
         return cols
 
-    def recover(self, seed, row_ids, cols, table):
+    def recover(self, seed, row_ids, cols, table, versions=None):
         w = np.zeros(len(row_ids), dtype=np.int64)
         for j in range(PIECES):
             piece = self.decoys[j].decode(cols[j], self._base(j, table, cols))
             w |= piece.astype(np.int64) << (BITS * j)
-        k = row_masks(derive(seed, self.name + "|mask"), row_ids, M)
+        k = row_masks(derive(seed, self.name + "|mask"), row_ids, M, versions)
         return self.dte.decode((w - k) % M)
+
+    def tags(self, mac_key, row_ids, versions, cols, table):
+        return integrity_tags(mac_key, [row_ids, versions, *cols, *[table[c].values for c in self.mac_bases]])
 
 
 # =============================================================== 5. datasets
@@ -181,6 +211,7 @@ def load(name):
         # One shared "order picking starts" time per invoice (public, carries no secret):
         # InvoiceDate + a delay of ~2 hours derived from a hash of the invoice number.
         h = pd.util.hash_pandas_object(table["Invoice"], index=False).values
+        table["InvoiceHash"] = h.view(np.int64)
         u01 = (h % np.uint64(1_000_000)).astype(float) / 1_000_000
         from statistics import NormalDist
         z = np.array([NormalDist().inv_cdf(min(max(x, 1e-6), 1 - 1e-6)) for x in np.unique(u01)])
@@ -194,6 +225,7 @@ def load(name):
                   OffsetDecoy(B, rng.lognormal(np.log(4 * 3600), 0.7, 200000), step=60),   # PackedAt  = PickedAt + ~4 h (packing queue)
                   OffsetDecoy(B, rng.lognormal(np.log(3 * 3600), 0.8, 200000), step=60)]   # ScannedAt = PackedAt + ~3 h (dispatch scan)
         fam = StorageOnly("price", HistogramDTE(table[secret].values, M), decoys, ["OrderStart", "prev", "prev"])
+        fam.mac_bases = ["InvoiceHash", "InvoiceDate"]
         names = ("PickedAt", "PackedAt", "ScannedAt")
         offsets = [("PickedAt - InvoiceDate (minutes)", "InvoiceDate", 0, 60),
                    ("PackedAt - PickedAt (minutes)", None, 1, 60),
@@ -213,10 +245,14 @@ def load(name):
                   OffsetDecoy(B, -rng.lognormal(np.log(240), 0.8, 200000))]  # DispatchTime = TIMESTAMP - ~4 min
         fam = StorageOnly("end_lat", HistogramDTE(table[secret].values, M), decoys,
                           ["START_LAT_u", "START_LON_u", "TIMESTAMP"])
+        fam.mac_bases = ["START_LAT_u", "START_LON_u", "TIMESTAMP"]
         names = ("Waypoint_LAT", "Waypoint_LON", "DispatchTime")
         offsets = [("Waypoint_LAT - START_LAT (metres)", "START_LAT_u", 0, 1 / 0.111),
                    ("Waypoint_LON - START_LON (metres)", "START_LON_u", 1, 1 / 0.084),
                    ("TIMESTAMP - DispatchTime (minutes)", "TIMESTAMP", 2, -60)]
+    # permanent primary key, assigned once when the table is protected and never reused
+    # (taxi TRIP_ID is not safe for this: 11 TRIP_IDs appear twice)
+    table.insert(0, "RowKey", np.arange(len(table), dtype=np.int64))
     return table, secret, fam, names, offsets
 
 
@@ -225,17 +261,18 @@ def main(name):
     print(f"Loading {name} ...")
     table, secret, fam, names, offsets = load(name)
     n = len(table)
-    ids = np.arange(n)
+    ids = table["RowKey"].values
+    ver = np.zeros(n, dtype=np.int64)
     values = table[secret].values
     print(f"  rows: {n:,} | distinct secret values: {len(np.unique(values)):,} | "
           f"{PIECES} pieces x {B} values, code space {M:,}")
 
     seed = new_seed()
     t = time.perf_counter()
-    cols = fam.split(seed, ids, values, table)
+    cols = fam.split(seed, ids, values, table, ver)
     t_split = time.perf_counter() - t
     t = time.perf_counter()
-    back = fam.recover(seed, ids, cols, table)
+    back = fam.recover(seed, ids, cols, table, ver)
     t_rec = time.perf_counter() - t
 
     print(f"\n[1] Exact rebuild with the right seed: {np.array_equal(back, values)}  "
@@ -246,7 +283,7 @@ def main(name):
     top = pd.Series(values).value_counts(normalize=True).head(5)
     shares = []
     for i in range(3):
-        wrong = fam.recover(new_seed(), ids, cols, table)
+        wrong = fam.recover(new_seed(), ids, cols, table, ver)
         shares.append(pd.Series(wrong).value_counts(normalize=True))
         print(f"    wrong seed {i + 1}: same value as truth in {np.mean(wrong == values):.4%} of rows")
     comp = pd.DataFrame({"value": top.index, "real share": top.values,
@@ -268,7 +305,66 @@ def main(name):
         print(f"\n[4b] Lines of the same order: median gap between their PickedAt = {np.median(gap):.0f} min "
               f"(90% within {np.percentile(gap, 90):.0f} min)")
 
-    out = table.drop(columns=[secret] + (["OrderStart"] if "OrderStart" in table else [])).copy()
+    rng = np.random.default_rng(1)
+
+    # ---------------------------------------------------------- [6] updates
+    print("\n[6] Updates: 20,000 rows get a new value and are re-protected")
+    upd = rng.choice(n, 20_000, replace=False)
+    new_vals = values.copy()
+    new_vals[upd] = rng.choice(values, len(upd))
+    sub = table.iloc[upd].reset_index(drop=True)
+
+    def w_of(c, t):  # what an attacker can compute: the masked code, from the public disguise
+        w = np.zeros(len(t), dtype=np.int64)
+        for j in range(PIECES):
+            base = c[j - 1] if fam.bases[j] == "prev" else t[fam.bases[j]].values
+            w |= fam.decoys[j].decode(c[j], base).astype(np.int64) << (BITS * j)
+        return w
+    old_cols = [np.asarray(c)[upd] for c in cols]
+    w_old = w_of(old_cols, sub)
+    for label, v_new in [("same version (old design)", ver[upd]), ("version + 1 (new design)", ver[upd] + 1)]:
+        new_cols = fam.split(seed, ids[upd], new_vals[upd], sub, v_new)
+        ok = np.array_equal(fam.recover(seed, ids[upd], new_cols, sub, v_new), new_vals[upd])
+        w_new = w_of(new_cols, sub)
+        # attacker who knows the OLD values guesses the NEW ones from w_new - w_old
+        u_old_guess = fam.dte.starts[np.searchsorted(fam.dte.vals, values[upd])] + \
+            fam.dte.slots[np.searchsorted(fam.dte.vals, values[upd])] // 2
+        guess = fam.dte.decode((u_old_guess + w_new - w_old) % M)
+        print(f"    {label:27s}: rebuild exact {ok} | attacker who knew the old values "
+              f"guesses the new value right in {np.mean(guess == new_vals[upd]):.1%} of rows")
+    print("    (chance level = how often a random honey value is right, about the wrong-seed match rate above)")
+
+    # ---------------------------------------------------------- [7] integrity
+    mac_key = os.urandom(16)  # separate random key, NOT derived from the seed
+    t = time.perf_counter()
+    tags = fam.tags(mac_key, ids, ver, cols, table)
+    t_tag = time.perf_counter() - t
+    print(f"\n[7] Integrity tags (separate key, {1e6 * t_tag / n:.3f} us/row):")
+    print(f"    untouched table: {np.mean(fam.tags(mac_key, ids, ver, cols, table) == tags):.4%} of rows pass")
+    bad = rng.choice(n, 1000, replace=False)
+    for label, edit in [("PickedAt-type column +1 step", "col"), ("base column edited", "base")]:
+        c2 = [np.asarray(c).copy() for c in cols]
+        t2 = table.copy()
+        if edit == "col":
+            c2[1][bad] = c2[1][bad] + (60 if name == "retail" else 1)
+        else:
+            bcol = fam.mac_bases[-1]
+            t2.loc[bad, bcol] = t2.loc[bad, bcol] + 60
+        changed = fam.recover(seed, ids[bad], [c[bad] for c in c2], t2.iloc[bad].reset_index(drop=True), ver[bad])
+        caught = fam.tags(mac_key, ids, ver, c2, t2)[bad] != tags[bad]
+        print(f"    1,000 rows tampered ({label:28s}): detected {caught.mean():.1%} | "
+              f"without the tag, {np.mean(changed != values[bad]):.1%} would silently decode to a different value")
+    print("    The tag uses only stored columns and its own key, so checking it reveals nothing about the seed.")
+
+    # ---------------------------------------------------------- [8] stable keys
+    perm = rng.permutation(n)
+    tp = table.iloc[perm].reset_index(drop=True)
+    cp = [np.asarray(c)[perm] for c in cols]
+    back_p = fam.recover(seed, tp["RowKey"].values, cp, tp, ver[perm])
+    print(f"\n[8] Table rows shuffled (as a database may do): rebuild by RowKey exact = "
+          f"{np.array_equal(back_p, values[perm])}")
+
+    out = table.drop(columns=[secret] + [c for c in ["OrderStart", "InvoiceHash"] if c in table]).copy()
     for nm, c in zip(names, cols):
         out[nm] = np.asarray(c).astype(np.int64)
     if name == "retail":

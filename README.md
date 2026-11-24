@@ -16,6 +16,16 @@ a correct guess from a wrong one.
 
 We tested 2 vs 3 columns; 3 columns gave better honey and more natural disguises.
 
+**Safety features**
+* **Versioned masks** – mask = PRF(seed, version ‖ RowKey). An updated value is re-protected
+  with version+1, so old and new rows never share a mask.
+* **Integrity tags** – a per-row AES-CBC-MAC under a *separate* random key covers RowKey,
+  version, the disguised columns and their base columns. It detects any edited cell and,
+  because it never uses the seed, cannot be used to test seed guesses (honey stays intact).
+  Tags are kept in a side table, not in the disguised table.
+* **Stable keys** – masks use a permanent `RowKey`, not the row position, so reordering the
+  table is harmless. (Taxi `TRIP_ID` is not used: 11 IDs appear twice.)
+
 ## Datasets (not included – download them into this folder)
 | Dataset | File | Source |
 |---|---|---|
@@ -37,6 +47,13 @@ python stealth_test.py                    # can an attacker find the hidden colu
 
 **Family 1** – exact rebuild 100% on both datasets; ~0.1 µs/row split, ~0.2 µs/row rebuild.
 Honey: most common real price is 12.16% of rows; under wrong seeds 12.16–12.20%.
+
+| Check (20,000 updated rows / 1,000 tampered rows) | Retail | Taxi |
+|---|---|---|
+| Attacker who knew old values guesses new ones – old design (same mask) | 63.8% | 65.9% |
+| Same attack – versioned masks | 5.2% (chance) | 0.0% |
+| Tampered rows detected by integrity tag | 100% | 100% |
+| Rebuild exact after shuffling rows | yes | yes |
 
 **Stealth** – share of the attacker's guesses that are correct (lower = better hidden), ML classifier:
 
