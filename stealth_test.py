@@ -24,11 +24,18 @@ Metrics, averaged over REPS random samples (mean +- std)
   AUC           0.5 = attacker ranks columns no better than random, 1.0 = perfect detection
 
 Run (same folder as family1_storage_only.py and the data files):
-    pip install numpy pandas cryptography openpyxl scipy scikit-learn
-    python stealth_test.py
+    pip install -r requirements.txt
+    python stealth_test.py                       # default: seeds 0-4, 10 samples each
+    python stealth_test.py --seeds 0 1 2 3 4 5 6 7 8 9   # more seeds, more precise
+    python stealth_test.py --seeds 0 --reps 5    # quick check
+
+Each seed is one full experiment: new secret keys AND a newly trained ML attacker.
+The ML attacker's result depends strongly on its training data, so results are
+averaged over several seeds. Same --seeds and --reps = identical table on every machine.
 """
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import os
 import sys
@@ -42,12 +49,22 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import roc_auc_score
 
 N_ROWS = 5000   # rows per random sample
-REPS = 10       # number of random samples per dataset
+REPS = 10       # random samples per dataset per seed (override with --reps)
+RNG = np.random.default_rng(0)  # all randomness of the test; reset by --seed
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 spec = importlib.util.spec_from_file_location("f1", os.path.join(HERE, "family1_storage_only.py"))
 f1 = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(f1)
+
+
+def use_seed(seed: int):
+    """Make the whole test reproducible: secret seeds, encoder randomness and AES
+    nonces all come from one seeded generator instead of os.urandom."""
+    global RNG
+    RNG = np.random.default_rng(seed)
+    f1.new_seed = lambda: RNG.bytes(32)
+    f1.fresh_random = lambda n, modulus: RNG.integers(0, modulus, n, dtype=np.int64)
 
 
 # =============================================================== data
@@ -147,7 +164,7 @@ def srsose(seed, secret, domain, H=1 << 25, t=250, P=(1 << 61) - 1):
 def aes_column(seed, secret):
     out = []
     for v in np.asarray(secret, dtype=np.int64):
-        nonce = os.urandom(16)
+        nonce = RNG.bytes(16)
         enc = Cipher(algorithms.AES(seed[:16]), modes.CTR(nonce)).encryptor()
         out.append((nonce + enc.update(int(v).to_bytes(8, "little", signed=True))).hex())
     return {"aes": np.array(out)}
@@ -252,11 +269,28 @@ def build(name):
 
 
 def main():
-    runs = []
-    for name in ["retail", "taxi"]:
-        print(f"Building tables for {name} ...")
-        runs += build(name)
+    global REPS
+    ap = argparse.ArgumentParser(description="SKAS stealth test")
+    ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4],
+                    help="random seeds; each is one full experiment (same seeds = same results)")
+    ap.add_argument("--reps", type=int, default=REPS, help="random samples per dataset per seed")
+    args = ap.parse_args()
+    REPS = args.reps
+    print(f"Stealth test: seeds {args.seeds}, {REPS} samples of {N_ROWS:,} rows per dataset per seed")
+    rows = []
+    for seed in args.seeds:
+        print(f"\n--- seed {seed} ---")
+        use_seed(seed)
+        runs = []
+        for name in ["retail", "taxi"]:
+            print(f"Building tables for {name} ...")
+            runs += build(name)
+        rows += evaluate(runs, seed)
 
+    report(pd.DataFrame(rows), args.seeds)
+
+
+def evaluate(runs, seed):
     rows = []
     for other, this in [("taxi", "retail"), ("retail", "taxi")]:
         Xtr, ytr = [], []
@@ -270,7 +304,7 @@ def main():
             if r["dataset"] != this:
                 continue
             F, prot = r["features"], r["protected"]
-            row = {"dataset": this, "scheme": r["scheme"], "rep": r["rep"],
+            row = {"dataset": this, "scheme": r["scheme"], "seed": seed, "rep": r["rep"],
                    "chance": len(prot) / r["n_cols"]}
             for det, fn in DETECTORS.items():
                 sc = {n: fn(F[n]) for n in F}
@@ -281,13 +315,15 @@ def main():
             row["ML classifier P@k"] = precision_at_k(sc, prot)
             row["ML classifier AUC"] = auc(sc, prot)
             rows.append(row)
+    return rows
 
-    df = pd.DataFrame(rows)
+
+def report(df, seeds):
     df.to_csv(os.path.join(HERE, "stealth_results_all_samples.csv"), index=False)
     metrics = [c for c in df.columns if c.endswith("P@k") or c.endswith("AUC")]
     for ds in ["retail", "taxi"]:
         sub = df[df.dataset == ds]
-        print(f"\n=== {ds.upper()} ({REPS} samples of {N_ROWS:,} rows) ===")
+        print(f"\n=== {ds.upper()} ({len(seeds)} seeds x {REPS} samples of {N_ROWS:,} rows; mean +- std over all samples) ===")
         for kind in ["P@k", "AUC"]:
             cols = [c for c in metrics if c.endswith(kind)]
             print(f"\n  {('precision@k  (chance shown)' if kind == 'P@k' else 'AUC  (0.5 = random guessing)')}")
@@ -299,6 +335,11 @@ def main():
                     line += f"  {g.chance.mean():6.2f}"
                 line += "".join(f" {g[c].mean():12.2f} +-{g[c].std():5.2f}" for c in cols)
                 print(line)
+        print("\n  ML classifier precision@k per seed (each seed = a newly trained attacker)")
+        for scheme, g in sub.groupby("scheme", sort=False):
+            per = g.groupby("seed")["ML classifier P@k"].mean()
+            print(f"  {scheme:18s}  " + "  ".join(f"{v:.2f}" for v in per.values) +
+                  f"   | mean {per.mean():.2f}, std across seeds {per.std():.2f}")
     print("\nPer-sample results saved to stealth_results_all_samples.csv")
 
 
