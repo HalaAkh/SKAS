@@ -47,7 +47,8 @@ python stealth_test.py                       # ~8–15 min: can an attacker find
 ```
 The first retail run is slower (reading the Excel file); later runs use a cache.
 `stealth_test.py` options: `--seeds 0 1 2 3 4` (default) and `--reps 10` (default).
-The same seeds and reps give an identical table on every machine.
+The same seeds and reps give an identical table on the same machine; on another machine
+(other OS or library versions) a few taxi numbers can differ by about ±0.05.
 
 ## Expected output
 `family1_storage_only.py` – for each dataset:
@@ -59,7 +60,7 @@ The same seeds and reps give an identical table on every machine.
 
 Timings and the exact honey percentages change slightly from run to run (new random keys).
 
-`stealth_test.py` – the tables below (identical with the default seeds).
+`stealth_test.py` – the tables below (with the default seeds; tiny differences across machines are normal).
 
 ## Results
 
@@ -79,7 +80,7 @@ mean, with the range over seeds in brackets.
 
 | Scheme | Retail (chance 0.27*) | Taxi (chance 0.21*) |
 |---|---|---|
-| **SKAS** | **0.60** (0.53–0.67) | **0.41** (0.33–0.60) |
+| **SKAS** | **0.60** (0.53–0.67) | **0.41–0.43** (0.33–0.63) |
 | Rahmani 2023a | 0.80 | 0.75 |
 | Rahmani 2022 | 1.00 | 0.92 |
 | SRSOSE | 1.00 | 0.99 |
